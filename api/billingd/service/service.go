@@ -500,10 +500,6 @@ func (s *Service) createSubscription(cus *Customer) error {
 
 func (s *Service) GetCustomer(ctx context.Context, req *pb.GetCustomerRequest) (
 	*pb.GetCustomerResponse, error) {
-	lck := s.semaphores.Get(customerLock(req.Key))
-	lck.Acquire()
-	defer lck.Release()
-
 	doc, err := s.getCustomer(ctx, "_id", req.Key)
 	if err != nil {
 		return nil, err
@@ -519,19 +515,27 @@ func periodToPb(period Period) *pb.Period {
 	}
 }
 
-func (s *Service) usageToPb(usage map[string]Usage) map[string]*pb.Usage {
+func (s *Service) dailyUsageToPb(usage map[string]Usage) map[string]*pb.Usage {
+	start, end := getCurrentDayBounds()
 	res := make(map[string]*pb.Usage)
 	for k, u := range usage {
 		product, ok := s.products[k]
 		if ok {
-			res[k] = getUsage(product, u.Total)
+			res[k] = getUsage(product, u.Total, Period{UnixStart: start, UnixEnd: end})
 		}
 	}
 	return res
 }
 
-func getUsage(product Product, total int64) *pb.Usage {
-	freeUnits, paidUnits := getDailyUnits(product, total)
+func getCurrentDayBounds() (int64, int64) {
+	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	end := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, time.Local)
+	return start.Unix(), end.Unix()
+}
+
+func getUsage(product Product, total int64, period Period) *pb.Usage {
+	freeUnits, paidUnits := getUnits(product, total)
 	free := product.FreeQuotaSize - total
 	if free < 0 {
 		free = 0
@@ -549,12 +553,25 @@ func getUsage(product Product, total int64) *pb.Usage {
 		desc = product.Name
 	}
 	return &pb.Usage{
+		Period:      periodToPb(period),
 		Description: desc,
 		Units:       freeUnits + paidUnits,
 		Total:       total,
 		Free:        free,
 		Cost:        cost,
 	}
+}
+
+func getUnits(product Product, total int64) (freeUnits, paidUnits int64) {
+	var freeSize, paidSize int64
+	if total > product.FreeQuotaSize {
+		freeSize = product.FreeQuotaSize
+		paidSize = total - product.FreeQuotaSize
+	} else {
+		freeSize = total
+	}
+	return int64(math.Round(float64(freeSize) / float64(product.UnitSize))),
+		int64(math.Round(float64(paidSize) / float64(product.UnitSize)))
 }
 
 func (s *Service) customerToPb(ctx context.Context, doc *Customer) (*pb.GetCustomerResponse, error) {
@@ -579,17 +596,13 @@ func (s *Service) customerToPb(ctx context.Context, doc *Customer) (*pb.GetCusto
 		CreatedAt:          doc.CreatedAt,
 		GracePeriodEnd:     gracePeriodEnd,
 		InvoicePeriod:      periodToPb(doc.InvoicePeriod),
-		DailyUsage:         s.usageToPb(doc.DailyUsage),
+		DailyUsage:         s.dailyUsageToPb(doc.DailyUsage),
 		Dependents:         deps,
 	}, nil
 }
 
 func (s *Service) GetCustomerSession(ctx context.Context, req *pb.GetCustomerSessionRequest) (
 	*pb.GetCustomerSessionResponse, error) {
-	lck := s.semaphores.Get(customerLock(req.Key))
-	lck.Acquire()
-	defer lck.Release()
-
 	doc, err := s.getCustomer(ctx, "_id", req.Key)
 	if err != nil {
 		return nil, err
@@ -608,10 +621,6 @@ func (s *Service) GetCustomerSession(ctx context.Context, req *pb.GetCustomerSes
 
 func (s *Service) ListDependentCustomers(ctx context.Context, req *pb.ListDependentCustomersRequest) (
 	*pb.ListDependentCustomersResponse, error) {
-	lck := s.semaphores.Get(customerLock(req.Key))
-	lck.Acquire()
-	defer lck.Release()
-
 	doc, err := s.getCustomer(ctx, "_id", req.Key)
 	if err != nil {
 		return nil, err
@@ -762,6 +771,52 @@ func (s *Service) DeleteCustomer(ctx context.Context, req *pb.DeleteCustomerRequ
 	return &pb.DeleteCustomerResponse{}, nil
 }
 
+func (s *Service) GetCustomerUsage(
+	ctx context.Context,
+	req *pb.GetCustomerUsageRequest,
+) (*pb.GetCustomerUsageResponse, error) {
+	doc, err := s.getCustomer(ctx, "_id", req.Key)
+	if err != nil {
+		return nil, err
+	}
+	usage := make(map[string]*pb.Usage)
+	for k, u := range doc.DailyUsage {
+		if product, ok := s.products[k]; ok {
+			free, err := s.getPeriodUsageItem(u.FreeItemID)
+			if err != nil {
+				return nil, err
+			}
+			paid, err := s.getPeriodUsageItem(u.PaidItemID)
+			if err != nil {
+				return nil, err
+			}
+			total := (free.TotalUsage + paid.TotalUsage) * product.UnitSize
+			usage[k] = getUsage(product, total, doc.InvoicePeriod)
+		}
+	}
+	return &pb.GetCustomerUsageResponse{
+		Usage: usage,
+	}, nil
+}
+
+func (s *Service) getPeriodUsageItem(id string) (sum *stripe.UsageRecordSummary, err error) {
+	params := &stripe.UsageRecordSummaryListParams{
+		SubscriptionItem: stripe.String(id),
+	}
+	params.Filters.AddFilter("limit", "", "1")
+	i := s.stripe.UsageRecordSummaries.List(params)
+	if i.Err() != nil {
+		return nil, i.Err()
+	}
+	for i.Next() {
+		sum = i.UsageRecordSummary()
+	}
+	if sum != nil && sum.Period != nil {
+		return sum, nil
+	}
+	return nil, fmt.Errorf("subscription item %s not found", id)
+}
+
 func (s *Service) IncCustomerUsage(
 	ctx context.Context,
 	req *pb.IncCustomerUsageRequest,
@@ -792,8 +847,7 @@ func (s *Service) handleCustomerUsage(
 	}
 
 	res := &pb.IncCustomerUsageResponse{
-		InvoicePeriod: periodToPb(cus.InvoicePeriod),
-		DailyUsage:    make(map[string]*pb.Usage),
+		DailyUsage: make(map[string]*pb.Usage),
 	}
 	for k, inc := range req.ProductUsage {
 		product, ok := s.products[k]
@@ -836,7 +890,22 @@ func (s *Service) handleUsage(ctx context.Context, cus *Customer, product Produc
 	if _, err := s.cdb.UpdateOne(ctx, bson.M{"_id": cus.Key}, bson.M{"$set": update}); err != nil {
 		return nil, err
 	}
-	return getUsage(product, total), nil
+	start, end := getCurrentDayBounds()
+	return getUsage(product, total, Period{UnixStart: start, UnixEnd: end}), nil
+}
+
+func (s *Service) ReportCustomerUsage(
+	ctx context.Context,
+	req *pb.ReportCustomerUsageRequest,
+) (*pb.ReportCustomerUsageResponse, error) {
+	doc, err := s.getCustomer(ctx, "_id", req.Key)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.reportCustomerUsage(ctx, doc); err != nil {
+		return nil, err
+	}
+	return &pb.ReportCustomerUsageResponse{}, nil
 }
 
 func (s *Service) reportUsage() error {
@@ -852,20 +921,8 @@ func (s *Service) reportUsage() error {
 		if err := cursor.Decode(&doc); err != nil {
 			return fmt.Errorf("decoding customer: %v", err)
 		}
-		for k, usage := range doc.DailyUsage {
-			if product, ok := s.products[k]; ok {
-				if err := s.reportDailyUnits(product, usage); err != nil {
-					return err
-				}
-				if product.FreeQuotaInterval == FreeQuotaDaily &&
-					product.PriceType == PriceTypeIncremental {
-					if _, err := s.cdb.UpdateOne(ctx, bson.M{"_id": doc.Key}, bson.M{
-						"$set": bson.M{"daily_usage." + k + ".total": 0},
-					}); err != nil {
-						return err
-					}
-				}
-			}
+		if err := s.reportCustomerUsage(ctx, &doc); err != nil {
+			return fmt.Errorf("reporting customer usage: %v", err)
 		}
 	}
 	if err := cursor.Err(); err != nil {
@@ -874,8 +931,28 @@ func (s *Service) reportUsage() error {
 	return nil
 }
 
-func (s *Service) reportDailyUnits(product Product, usage Usage) error {
-	freeUnits, paidUnits := getDailyUnits(product, usage.Total)
+func (s *Service) reportCustomerUsage(ctx context.Context, cus *Customer) error {
+	for k, usage := range cus.DailyUsage {
+		if product, ok := s.products[k]; ok {
+			if err := s.reportUnits(product, usage); err != nil {
+				return err
+			}
+			log.Debugf("reported usage for %s: %s=%d", cus.Key, k, usage.Total)
+			if product.FreeQuotaInterval == FreeQuotaDaily &&
+				product.PriceType == PriceTypeIncremental {
+				if _, err := s.cdb.UpdateOne(ctx, bson.M{"_id": cus.Key}, bson.M{
+					"$set": bson.M{"daily_usage." + k + ".total": 0},
+				}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) reportUnits(product Product, usage Usage) error {
+	freeUnits, paidUnits := getUnits(product, usage.Total)
 	if freeUnits > 0 {
 		if _, err := s.stripe.UsageRecords.New(&stripe.UsageRecordParams{
 			SubscriptionItem: stripe.String(usage.FreeItemID),
@@ -897,16 +974,4 @@ func (s *Service) reportDailyUnits(product Product, usage Usage) error {
 		}
 	}
 	return nil
-}
-
-func getDailyUnits(product Product, total int64) (freeUnits, paidUnits int64) {
-	var freeSize, paidSize int64
-	if total > product.FreeQuotaSize {
-		freeSize = product.FreeQuotaSize
-		paidSize = total - product.FreeQuotaSize
-	} else {
-		freeSize = total
-	}
-	return int64(math.Round(float64(freeSize) / float64(product.UnitSize))),
-		int64(math.Round(float64(paidSize) / float64(product.UnitSize)))
 }

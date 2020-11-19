@@ -129,6 +129,12 @@ func (c *Client) DeleteCustomer(ctx context.Context, key thread.PubKey) error {
 	return err
 }
 
+func (c *Client) GetCustomerUsage(ctx context.Context, key thread.PubKey) (*pb.GetCustomerUsageResponse, error) {
+	return c.c.GetCustomerUsage(ctx, &pb.GetCustomerUsageRequest{
+		Key: key.String(),
+	})
+}
+
 func (c *Client) IncCustomerUsage(
 	ctx context.Context,
 	key thread.PubKey,
@@ -138,4 +144,11 @@ func (c *Client) IncCustomerUsage(
 		Key:          key.String(),
 		ProductUsage: productUsage,
 	})
+}
+
+func (c *Client) ReportCustomerUsage(ctx context.Context, key thread.PubKey) error {
+	_, err := c.c.ReportCustomerUsage(ctx, &pb.ReportCustomerUsageRequest{
+		Key: key.String(),
+	})
+	return err
 }
