@@ -530,7 +530,7 @@ func (s *Service) dailyUsageToPb(usage map[string]Usage) map[string]*pb.Usage {
 func getCurrentDayBounds() (int64, int64) {
 	now := time.Now()
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
-	end := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, time.Local)
+	end := time.Date(now.Year(), now.Month(), now.Day(), 24, 0, 0, 0, time.Local)
 	return start.Unix(), end.Unix()
 }
 
@@ -782,6 +782,7 @@ func (s *Service) GetCustomerUsage(
 	usage := make(map[string]*pb.Usage)
 	for k, u := range doc.DailyUsage {
 		if product, ok := s.products[k]; ok {
+			// Get reported usage over the current invoice period
 			free, err := s.getPeriodUsageItem(u.FreeItemID)
 			if err != nil {
 				return nil, err
@@ -791,6 +792,8 @@ func (s *Service) GetCustomerUsage(
 				return nil, err
 			}
 			total := (free.TotalUsage + paid.TotalUsage) * product.UnitSize
+			// Add current day unreported usage
+			total += u.Total
 			usage[k] = getUsage(product, total, doc.InvoicePeriod)
 		}
 	}
