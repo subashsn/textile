@@ -405,28 +405,35 @@ func (s *Service) CheckHealth(_ context.Context, _ *pb.CheckHealthRequest) (*pb.
 
 func (s *Service) CreateCustomer(ctx context.Context, req *pb.CreateCustomerRequest) (
 	*pb.CreateCustomerResponse, error) {
-	customer, err := s.stripe.Customers.New(&stripe.CustomerParams{
-		Email: stripe.String(req.Email),
-	})
-	if err != nil {
-		return nil, err
-	}
+	lck := s.semaphores.Get(customerLock(req.Key))
+	lck.Acquire()
+	defer lck.Release()
+
 	if req.ParentKey != "" {
 		if _, err := s.getCustomer(ctx, "_id", req.ParentKey); err != nil {
 			return nil, err
 		}
 	}
 	doc := &Customer{
-		Key:        req.Key,
-		CustomerID: customer.ID,
-		ParentKey:  req.ParentKey,
-		Email:      customer.Email,
-		CreatedAt:  time.Now().Unix(),
+		Key:       req.Key,
+		ParentKey: req.ParentKey,
+		CreatedAt: time.Now().Unix(),
 	}
+	if _, err := s.cdb.InsertOne(ctx, doc); err != nil {
+		return nil, err
+	}
+	customer, err := s.stripe.Customers.New(&stripe.CustomerParams{
+		Email: stripe.String(req.Email),
+	})
+	if err != nil {
+		return nil, err
+	}
+	doc.CustomerID = customer.ID
+	doc.Email = customer.Email
 	if err := s.createSubscription(doc); err != nil {
 		return nil, err
 	}
-	if _, err := s.cdb.InsertOne(ctx, doc); err != nil {
+	if _, err := s.cdb.UpdateOne(ctx, bson.M{"_id": doc.Key}, bson.M{"$set": doc}); err != nil {
 		return nil, err
 	}
 	log.Debugf("created customer %s with id %s", doc.Key, doc.CustomerID)
