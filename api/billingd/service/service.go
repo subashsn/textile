@@ -793,7 +793,11 @@ func (s *Service) GetCustomerUsage(
 			}
 			total := (free.TotalUsage + paid.TotalUsage) * product.UnitSize
 			// Add current day unreported usage
-			total += u.Total
+			if product.FreeQuotaInterval == FreeQuotaDaily &&
+				product.PriceType == PriceTypeIncremental {
+				// Add current day unreported usage
+				total += u.Total
+			}
 			usage[k] = getUsage(product, total, doc.InvoicePeriod)
 		}
 	}
