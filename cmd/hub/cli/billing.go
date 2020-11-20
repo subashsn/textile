@@ -58,7 +58,9 @@ var billingPortalCmd = &cobra.Command{
 var billingUsageCmd = &cobra.Command{
 	Use:   "usage",
 	Short: "Show usage and billing info",
-	Long: `Shows usage and billing information.
+	Long: `Shows usage and billing information
+
+Usage is evaluated daily and invoiced monthly.
 
 Use the --user flag to get usage for a dependent user.`,
 	Args: cobra.MaximumNArgs(1),
